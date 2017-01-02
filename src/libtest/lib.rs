@@ -55,7 +55,6 @@ use self::OutputLocation::*;
 
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::any::Any;
-use std::cmp;
 use std::collections::BTreeMap;
 use std::env;
 use std::fmt;
@@ -1484,67 +1483,76 @@ fn ns_iter_inner<T, F>(inner: &mut F, k: u64) -> u64
 pub fn iter<T, F>(inner: &mut F) -> stats::Summary
     where F: FnMut() -> T
 {
-    // Initial bench run to get ballpark figure.
-    let ns_single = ns_iter_inner(inner, 1);
+    // Batches must all exceed
+    const NS_BATCH_MIN: u64 = 1_000_000;
+    // Stop after
+    const NS_TOTAL_MAX: u64 = 3_000_000_000;
 
-    // Try to estimate iter count for 1ms falling back to 1m
-    // iterations if first run took < 1ns.
-    let ns_target_total = 1_000_000; // 1ms
-    let mut n = ns_target_total / cmp::max(1, ns_single);
+    const MAX_BATCHES: usize = 1000;
+    const MIN_BATCHES: usize = 5;
+    const STD_DEV_CONFIDENCE: f64 = 3.0; // assuming normal, gets us 99.7% confidence
+    const MAX_ERROR: f64 = 0.01;
 
-    // if the first run took more than 1ms we don't want to just
-    // be left doing 0 iterations on every loop. The unfortunate
-    // side effect of not being able to do as many runs is
-    // automatically handled by the statistical analysis below
-    // (i.e. larger error bars).
-    n = cmp::max(1, n);
+    let mut samples = Vec::with_capacity(MAX_BATCHES);
 
-    let mut total_run = Duration::new(0, 0);
-    let samples: &mut [f64] = &mut [0.0_f64; 50];
-    loop {
-        let loop_start = Instant::now();
-
-        for p in &mut *samples {
-            *p = ns_iter_inner(inner, n) as f64 / n as f64;
+    let mut n: u64 = 1;
+    let mut ns_total: u64 = 0;
+    while samples.len() < MAX_BATCHES {
+        let ns_batch = ns_iter_inner(inner, n);
+        ns_total = ns_total + ns_batch;
+        if ns_batch < NS_BATCH_MIN
+        {
+            n = n * 2;
+            samples.truncate(0);
+            continue;
         }
 
-        stats::winsorize(samples, 5.0);
-        let summ = stats::Summary::new(samples);
+        samples.push(ns_batch as f64 / n as f64);
 
-        for p in &mut *samples {
-            let ns = ns_iter_inner(inner, 5 * n);
-            *p = ns as f64 / (5 * n) as f64;
+        if ns_total > NS_TOTAL_MAX {
+            //println!("TimeLimit hit. Samples: {}, N: {}, TotalTime {}", samples.len(), n, ns_total);
+            // hard time limit, stop now
+            // should only hit this for very long tests doing a single run,
+            // or in the case of very slow outliers
+            break;
         }
 
-        stats::winsorize(samples, 5.0);
-        let summ5 = stats::Summary::new(samples);
+        if samples.len() >= MIN_BATCHES {
+            // We have some data: decide/guess if its enough.
 
-        let loop_run = loop_start.elapsed();
+            // Assuming each value is an IID (Independent and identically distributed random variable) (thats a questionable assumption)
+            // We can assume (if batch size is big enough) that the samples are normally distributed IIDs by the CLT (central limit theorm)
 
-        // If we've run for 100ms and seem to have converged to a
-        // stable median.
-        if loop_run > Duration::from_millis(100) && summ.median_abs_dev_pct < 1.0 &&
-           summ.median - summ5.median < summ5.median_abs_dev {
-            return summ5;
-        }
+            // FIXME: this confidence interval logic should be deduplicated with the logic that prints the invervals for the user.
+            // FIXME: consider droping outliers on the high side. Maybe we need some configuration to select targeting min vs mean vs median.
 
-        total_run = total_run + loop_run;
-        // Longest we ever run for is 3s.
-        if total_run > Duration::from_secs(3) {
-            return summ5;
-        }
+            // FIXME: use running totals of just required stats (much more efficent)
+            let summ = stats::Summary::new(samples.as_slice());
 
-        // If we overflow here just return the results so far. We check a
-        // multiplier of 10 because we're about to multiply by 2 and the
-        // next iteration of the loop will also multiply by 5 (to calculate
-        // the summ5 result)
-        n = match n.checked_mul(10) {
-            Some(_) => n * 2,
-            None => {
-                return summ5;
+            // Estimate upper bound for variance of sample means:
+            // We might not have many samples, and distrobution may be badly skewed, so lets guess something pretty safe. (This still could be too low)
+            // FIXME: consider batch count and distrobution shape here. For now protected by MIN_BATCHES not being too tiny.
+            let variance_guess = summ.std_dev;
+
+            // FIXME: this assumes normal, but the CLT won't give exactly normal, or even close to normal if batch count is low, or not IIDs.
+            // This is based on the equation for standard error.
+            let mean_standard_error_guess = variance_guess / ((samples.len() as f64).sqrt());
+
+            let error_dist = mean_standard_error_guess * STD_DEV_CONFIDENCE;
+            let tolerance = MAX_ERROR * summ.mean;
+            
+            // Is our conficence interval's errors withing tolerance?
+            if error_dist < tolerance {
+                //println!("Samples: {}, N: {}, tolerance: {}, error_dist: {}, variance_guess: {}", samples.len(), n, tolerance, error_dist, variance_guess);
+                // Thats prabably enough sample means for the mean of our sample means to be off by less than MAX_ERROR with confidence set by STD_DEV_CONFIDENCE
+                break;
             }
-        };
+        }
     }
+
+    //println!("Samples: {}, N: {}, TotalTime {}", samples.len(), n, ns_total);
+
+    return stats::Summary::new(samples.as_slice());
 }
 
 pub mod bench {
